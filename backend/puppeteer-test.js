@@ -1,218 +1,198 @@
 import puppeteer from "puppeteer";
 
-const TARGET_SIZE = "M";
-const PRODUCT_URL = "https://www.zara.com/tr/tr/akici-pareo-etek-zw-collection-p09800001.html?v1=493344507&v2=2635747";
-
 const AVAILABLE_STATUSES = new Set(["in_stock", "low_on_stock"]);
+const SIZE_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "XXL"];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function deepFindSku(obj) {
-  // JSON içinde sku/skuId arayan basit ama güçlü tarayıcı
-  const found = new Set();
-
-  const walk = (x) => {
-    if (!x) return;
-    if (typeof x !== "object") return;
-
-    if (Array.isArray(x)) {
-      for (const i of x) walk(i);
-      return;
-    }
-
-    for (const [k, v] of Object.entries(x)) {
-      const key = k.toLowerCase();
-      if ((key === "sku" || key === "skuid" || key === "sku_id") && (typeof v === "number" || typeof v === "string")) {
-        const n = Number(v);
-        if (!Number.isNaN(n)) found.add(String(n));
-      }
-      walk(v);
-    }
-  };
-
-  walk(obj);
-  return [...found];
+function getV1ProductId(url) {
+  try {
+    const u = new URL(url);
+    return u.searchParams.get("v1");
+  } catch {
+    return null;
+  }
 }
 
-async function ensureSizes(page) {
-  // scroll + click ile size selector’ı görünür yapıp bedenleri çek
-  const read = () =>
-    page.evaluate(() => {
-      const ul =
-        document.querySelector("ul.size-selector-sizes") ||
-        document.querySelector("ul[class*='size-selector-sizes']") ||
-        document.querySelector("[class*='size-selector'] ul");
+function firstSix(n) {
+  const s = String(n);
+  return s.length >= 6 ? s.slice(0, 6) : null;
+}
 
-      if (!ul) return [];
+async function clickAdd(page) {
+  return await page.evaluate(() => {
+    const targets = new Set([
+      "EKLE",
+      "SEPETE EKLE",
+      "ADD",
+      "ADD TO BAG",
+      "ADD TO CART",
+    ]);
 
-      const lis = Array.from(ul.querySelectorAll("li"));
-      return lis
-        .map((li) => {
-          const labelEl =
-            li.querySelector('[data-qa-qualifier="size-selector-sizes-size-label"]') ||
-            li.querySelector("[class*='size-selector-sizes-size-label']") ||
-            li.querySelector("[data-qa-qualifier*='size-label']");
+    const btns = Array.from(document.querySelectorAll("button"));
 
-          const size = (labelEl?.textContent || "").trim();
-          const btn = li.querySelector("button");
-          const qaAction = btn?.getAttribute("data-qa-action") || "";
+    const visible = (b) => {
+      const r = b.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
 
-          const className = li.className || "";
-          const isDisabled =
-            className.includes("size-selector-sizes__size--disabled") ||
-            qaAction === "size-out-of-stock" ||
-            (li.textContent || "").toLowerCase().includes("benzer ürünler");
-
-          return { size, isDisabled };
-        })
-        .filter((x) => x.size);
+    const btn = btns.find((b) => {
+      const t = (b.innerText || "").trim().toUpperCase();
+      return visible(b) && targets.has(t);
     });
 
-  let sizes = await read();
-  if (sizes.length) return sizes;
-
-  await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.8));
-  await sleep(1200);
-
-  sizes = await read();
-  if (sizes.length) return sizes;
-
-  await page.evaluate(() => {
-    const el =
-      document.querySelector('[data-qa-qualifier*="size-selector"]') ||
-      document.querySelector('[class*="size-selector"]') ||
-      document.querySelector('button[class*="size-selector"]');
-    if (el && el instanceof HTMLElement) el.click();
-  });
-  await sleep(1500);
-
-  sizes = await read();
-  return sizes;
-}
-
-async function clickSize(page, size) {
-  // TARGET_SIZE butonuna tıkla
-  return page.evaluate((target) => {
-    const lis = Array.from(document.querySelectorAll("ul.size-selector-sizes li, ul[class*='size-selector'] li"));
-    for (const li of lis) {
-      const labelEl =
-        li.querySelector('[data-qa-qualifier="size-selector-sizes-size-label"]') ||
-        li.querySelector("[class*='size-selector-sizes-size-label']") ||
-        li.querySelector("[data-qa-qualifier*='size-label']");
-
-      const s = (labelEl?.textContent || "").trim();
-      if (s === target) {
-        const btn = li.querySelector("button");
-        if (btn && btn instanceof HTMLElement) {
-          btn.click();
-          return true;
-        }
-      }
+    if (btn) {
+      btn.click();
+      return true;
     }
     return false;
-  }, size);
-}
-
-async function run() {
-  const browser = await puppeteer.launch({ headless: false, defaultViewport: null });
-  const page = await browser.newPage();
-
-  let availabilityMap = {};
-  let availabilityReady = false;
-
-  // SKU’yu bulmak için click sonrası response’ları tarayacağız
-  let clickedSkuCandidates = [];
-  let clickWindowOpen = false;
-
-  page.on("response", async (res) => {
-    const url = res.url();
-
-    // availability yakala
-    if (url.includes("/availability")) {
-      try {
-        const data = await res.json();
-        if (Array.isArray(data?.skusAvailability)) {
-          availabilityMap = {};
-          for (const s of data.skusAvailability) availabilityMap[String(s.sku)] = s.availability;
-          availabilityReady = true;
-          console.log("📦 AVAILABILITY YAKALANDI");
-        }
-      } catch {}
-    }
-
-    // click sonrası kısa pencerede gelen JSON’lardan SKU ara
-    if (clickWindowOpen) {
-      try {
-        const ct = (res.headers()["content-type"] || "").toLowerCase();
-        if (!ct.includes("application/json")) return;
-
-        const data = await res.json();
-        const skus = deepFindSku(data);
-        if (skus.length) {
-          clickedSkuCandidates.push(...skus);
-          clickedSkuCandidates = [...new Set(clickedSkuCandidates)];
-        }
-      } catch {}
-    }
   });
-
-  await page.goto(PRODUCT_URL, { waitUntil: "domcontentloaded", timeout: 0 });
-  console.log("✅ Sayfa açıldı");
-  await sleep(2000);
-
-  const sizes = await ensureSizes(page);
-  console.log("👀 DOM BEDENLER:", sizes);
-
-  const target = sizes.find((x) => x.size === TARGET_SIZE);
-  if (!target) {
-    console.log(`❌ DOM’da ${TARGET_SIZE} yok. (farklı beden sistemi olabilir)`);
-    await new Promise(() => {});
-    return;
-  }
-  if (target.isDisabled) {
-    console.log(`⛔️ DOM’a göre ${TARGET_SIZE} stokta değil (disabled/out-of-stock).`);
-    await new Promise(() => {});
-    return;
-  }
-
-  // ✅ Bedene tıkla ve click sonrası SKU yakalamaya çalış
-  clickedSkuCandidates = [];
-  clickWindowOpen = true;
-
-  const clicked = await clickSize(page, TARGET_SIZE);
-  console.log(clicked ? `🖱️ ${TARGET_SIZE} tıklandı` : `⚠️ ${TARGET_SIZE} tıklanamadı`);
-
-  // click sonrası 2.5sn dinle
-  await sleep(2500);
-  clickWindowOpen = false;
-
-  console.log("🎯 Click sonrası SKU adayları:", clickedSkuCandidates);
-
-  // availability hazır değilse biraz bekle
-  for (let i = 0; i < 6 && !availabilityReady; i++) await sleep(1000);
-
-  if (!availabilityReady) {
-    console.log("⚠️ availability gelmedi; şimdilik karar veremiyorum.");
-    await new Promise(() => {});
-    return;
-  }
-
-  // SKU adaylarından availability’de olanı seç
-  const matched = clickedSkuCandidates.find((sku) => availabilityMap[sku]);
-  if (!matched) {
-    console.log("⚠️ Click sonrası SKU’yu availability ile eşleştiremedim (endpoint değişmiş olabilir).");
-    console.log("availabilityMap keys örnek:", Object.keys(availabilityMap).slice(0, 10));
-    await new Promise(() => {});
-    return;
-  }
-
-  const status = availabilityMap[matched];
-  if (AVAILABLE_STATUSES.has(status)) {
-    console.log(`🎉🎉🎉 ${TARGET_SIZE} BEDEN STOKTA! (SKU: ${matched}, ${status})`);
-  } else {
-    console.log(`❌ ${TARGET_SIZE} stokta değil (SKU: ${matched}, ${status})`);
-  }
-
-  await new Promise(() => {});
 }
 
-run();
+async function readSizesFromPanel(page) {
+  return await page.evaluate(() => {
+    const ul =
+      document.querySelector("ul.size-selector-sizes") ||
+      document.querySelector("ul[class*='size-selector-sizes']") ||
+      document.querySelector("[class*='size-selector'] ul");
+
+    if (!ul) return [];
+
+    const lis = Array.from(ul.querySelectorAll("li"));
+
+    return lis
+      .map((li) => {
+        const labelEl =
+          li.querySelector('[data-qa-qualifier="size-selector-sizes-size-label"]') ||
+          li.querySelector("[class*='size-selector-sizes-size-label']") ||
+          li.querySelector("[data-qa-qualifier*='size-label']") ||
+          li.querySelector("span");
+
+        const size = (labelEl?.textContent || "").trim();
+        if (!size) return null;
+
+        const className = li.className || "";
+        const isDisabledClass = className.includes("size-selector-sizes__size--disabled");
+
+        const btn = li.querySelector("button");
+        const qaAction = btn?.getAttribute("data-qa-action") || "";
+
+        const isOut = qaAction === "size-out-of-stock";
+        const disabled = isDisabledClass || isOut;
+
+        return { size, disabled, qaAction, rawClass: className };
+      })
+      .filter(Boolean);
+  });
+}
+
+/**
+ * ✅ TEK HEDEF: puppeteer-test’i fonksiyon yapmak
+ * Kullanım:
+ *   const r = await checkStock({ url, size: "M", headless: false })
+ */
+export async function checkStock({ url, size, headless = false, keepOpen = false }) 
+{
+  const PRODUCT_URL = url;
+  const TARGET_SIZE = String(size || "").toUpperCase();
+
+  const browser = await puppeteer.launch({ headless, defaultViewport: null });
+
+  try {
+    const page = await browser.newPage();
+
+    const wantedProductId = getV1ProductId(PRODUCT_URL);
+    // console.log("🎯 Beklenen v1 productId:", wantedProductId);
+
+    let availabilityMap = {};
+    let availabilityReady = false;
+
+    page.on("response", async (res) => {
+      const rurl = res.url();
+      if (!rurl.includes("/availability")) return;
+
+      // sadece seçili v1 productId
+      if (wantedProductId && !rurl.includes(`/product/id/${wantedProductId}/availability`)) return;
+
+      try {
+        const data = await res.json();
+        if (!Array.isArray(data?.skusAvailability)) return;
+
+        availabilityMap = {};
+        for (const s of data.skusAvailability) availabilityMap[String(s.sku)] = s.availability;
+        availabilityReady = true;
+      } catch {}
+    });
+
+    await page.goto(PRODUCT_URL, { waitUntil: "domcontentloaded", timeout: 0 });
+    await sleep(1500);
+
+    const addOk = await clickAdd(page);
+    if (!addOk) {
+      return { ok: false, reason: "EKLE butonu bulunamadı" };
+    }
+
+    // panelin gerçekten geldiğinden emin olalım
+    const panelOk = await page
+      .waitForSelector("ul.size-selector-sizes, ul[class*='size-selector-sizes'], [class*='size-selector'] ul", { timeout: 8000 })
+      .then(() => true)
+      .catch(() => false);
+
+    if (!panelOk) {
+      return { ok: false, reason: "Panel açılmadı" };
+    }
+
+
+    let domSizes = [];
+    for (let i = 0; i < 3; i++) {
+      domSizes = await readSizesFromPanel(page);
+      if (domSizes.length) break;
+      await sleep(800);
+    }
+
+    if (!domSizes.length) {
+      return { ok: false, reason: "Panelden beden okunamadı" };
+    }
+
+    const orderedDomSizes = domSizes
+      .map((x) => x.size)
+      .filter((s) => SIZE_ORDER.includes(s))
+      .sort((a, b) => SIZE_ORDER.indexOf(a) - SIZE_ORDER.indexOf(b));
+
+    for (let i = 0; i < 6 && !availabilityReady; i++) await sleep(800);
+    if (!availabilityReady) {
+      return { ok: false, reason: "availability gelmedi" };
+    }
+
+    const sortedSkus = Object.keys(availabilityMap).map(Number).sort((a, b) => a - b);
+
+    if (sortedSkus.length !== orderedDomSizes.length) {
+      return { ok: false, reason: "SKU sayısı ≠ beden sayısı" };
+    }
+
+    const prefixes = new Set(sortedSkus.map(firstSix));
+    if (prefixes.size !== 1) {
+      return { ok: false, reason: "SKU ilk 6 hane aynı değil" };
+    }
+
+    const sizeSkuMap = {};
+    orderedDomSizes.forEach((s, i) => (sizeSkuMap[s] = sortedSkus[i]));
+
+    if (!(TARGET_SIZE in sizeSkuMap)) {
+      return { ok: true, inStock: false, detail: `${TARGET_SIZE} bu üründe yok`, sizeSkuMap };
+    }
+
+    const sku = sizeSkuMap[TARGET_SIZE];
+    const status = availabilityMap[String(sku)];
+    const inStock = AVAILABLE_STATUSES.has(status);
+
+    return { ok: true, inStock, status, sku, sizeSkuMap };
+  } catch (e) {
+    return { ok: false, reason: e?.message || "unknown_error" };
+  } finally {
+    if (keepOpen) {
+      await new Promise(() => {}); // açık kalsın
+    }
+    await browser.close();
+  }
+}
+
